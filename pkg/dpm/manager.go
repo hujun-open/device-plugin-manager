@@ -1,6 +1,7 @@
 package dpm
 
 import (
+	"iter"
 	"os"
 	"os/signal"
 	"sync"
@@ -23,7 +24,9 @@ const (
 // available resources and start/stop plugins accordingly. It also handles system signals and
 // unexpected kubelet events.
 type Manager struct {
-	lister ListerInterface
+	lister       ListerInterface
+	pluginMap    map[string]devicePlugin
+	pluginMapMux *sync.RWMutex
 }
 
 // NewManager is the canonical way of initializing Manager. User must provide ListerInterface
@@ -31,7 +34,9 @@ type Manager struct {
 // availability and provide method to spawn plugins that will handle found resources.
 func NewManager(lister ListerInterface) *Manager {
 	dpm := &Manager{
-		lister: lister,
+		lister:       lister,
+		pluginMap:    make(map[string]devicePlugin),
+		pluginMapMux: new(sync.RWMutex),
 	}
 	return dpm
 }
@@ -56,7 +61,7 @@ func (dpm *Manager) Run() {
 
 	// Create list of running plugins and start Discover method of given lister. This method is
 	// responsible of notifying manager about changes in available plugins.
-	var pluginMap = make(map[string]devicePlugin)
+
 	glog.V(3).Info("Starting Discovery on new plugins")
 	pluginsCh := make(chan PluginNameList)
 	defer close(pluginsCh)
@@ -69,33 +74,64 @@ HandleSignals:
 		select {
 		case newPluginsList := <-pluginsCh:
 			glog.V(3).Infof("Received new list of plugins: %s", newPluginsList)
-			dpm.handleNewPlugins(pluginMap, newPluginsList)
+			dpm.handleNewPlugins(newPluginsList)
 		case event := <-fsWatcher.Events:
 			if event.Name == pluginapi.KubeletSocket {
 				glog.V(3).Infof("Received kubelet socket event: %s", event)
 				if event.Op&fsnotify.Create == fsnotify.Create {
-					dpm.startPluginServers(pluginMap)
+					dpm.startPluginServers()
 				}
 				// TODO: Kubelet doesn't really clean-up it's socket, so this is currently
 				// manual-testing thing. Could we solve Kubelet deaths better?
 				if event.Op&fsnotify.Remove == fsnotify.Remove {
-					dpm.stopPluginServers(pluginMap)
+					dpm.stopPluginServers()
 				}
 			}
 		case s := <-signalCh:
 			switch s {
 			case syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGINT:
 				glog.V(3).Infof("Received signal \"%v\", shutting down", s)
-				dpm.stopPlugins(pluginMap)
+				dpm.stopPlugins()
 				break HandleSignals
 			}
 		}
 	}
 }
 
-func (dpm *Manager) handleNewPlugins(currentPluginsMap map[string]devicePlugin, newPluginsList PluginNameList) {
+func (dpm *Manager) getDevicePlugin(name string) (devicePlugin, bool) {
+	dpm.pluginMapMux.RLock()
+	defer dpm.pluginMapMux.RUnlock()
+	r, ok := dpm.pluginMap[name]
+	return r, ok
+}
+
+func (dpm *Manager) setDevicePlugin(name string, dp devicePlugin) {
+	dpm.pluginMapMux.Lock()
+	defer dpm.pluginMapMux.Unlock()
+	dpm.pluginMap[name] = dp
+}
+
+func (dpm *Manager) delDevicePlugin(name string) {
+	dpm.pluginMapMux.Lock()
+	defer dpm.pluginMapMux.Unlock()
+	delete(dpm.pluginMap, name)
+}
+
+func (dpm *Manager) iterPluginMap() iter.Seq2[string, devicePlugin] {
+	return func(yield func(string, devicePlugin) bool) {
+		dpm.pluginMapMux.RLock()
+		defer dpm.pluginMapMux.RUnlock() // Guaranteed to unlock even on 'break'
+
+		for k, v := range dpm.pluginMap {
+			if !yield(k, v) {
+				return // The caller stopped the loop (e.g., via 'break')
+			}
+		}
+	}
+}
+
+func (dpm *Manager) handleNewPlugins(newPluginsList PluginNameList) {
 	var wg sync.WaitGroup
-	var pluginMapMutex = &sync.Mutex{}
 
 	// This map is used for faster searches when removing old plugins
 	newPluginsSet := make(map[string]bool)
@@ -105,14 +141,12 @@ func (dpm *Manager) handleNewPlugins(currentPluginsMap map[string]devicePlugin, 
 		newPluginsSet[newPluginLastName] = true
 		wg.Add(1)
 		go func(name string) {
-			if _, ok := currentPluginsMap[name]; !ok {
+			if _, ok := dpm.getDevicePlugin(name); !ok {
 				// add new plugin only if it doesn't already exist
 				glog.V(3).Infof("Adding a new plugin \"%s\"", name)
 				plugin := newDevicePlugin(dpm.lister.GetResourceNamespace(), name, dpm.lister.NewPlugin(name))
 				startPlugin(name, plugin)
-				pluginMapMutex.Lock()
-				currentPluginsMap[name] = plugin
-				pluginMapMutex.Unlock()
+				dpm.setDevicePlugin(name, plugin)
 			}
 			wg.Done()
 		}(newPluginLastName)
@@ -120,15 +154,13 @@ func (dpm *Manager) handleNewPlugins(currentPluginsMap map[string]devicePlugin, 
 	wg.Wait()
 
 	// Remove old plugins
-	for pluginLastName, currentPlugin := range currentPluginsMap {
+	for pluginLastName, currentPlugin := range dpm.iterPluginMap() {
 		wg.Add(1)
 		go func(name string, plugin devicePlugin) {
 			if _, found := newPluginsSet[name]; !found {
 				glog.V(3).Infof("Remove unused plugin \"%s\"", name)
 				stopPlugin(name, plugin)
-				pluginMapMutex.Lock()
-				delete(currentPluginsMap, name)
-				pluginMapMutex.Unlock()
+				dpm.delDevicePlugin(name)
 			}
 			wg.Done()
 		}(pluginLastName, currentPlugin)
@@ -136,10 +168,10 @@ func (dpm *Manager) handleNewPlugins(currentPluginsMap map[string]devicePlugin, 
 	wg.Wait()
 }
 
-func (dpm *Manager) startPluginServers(pluginMap map[string]devicePlugin) {
+func (dpm *Manager) startPluginServers() {
 	var wg sync.WaitGroup
 
-	for pluginLastName, currentPlugin := range pluginMap {
+	for pluginLastName, currentPlugin := range dpm.iterPluginMap() {
 		wg.Add(1)
 		go func(name string, plugin devicePlugin) {
 			startPluginServer(name, plugin)
@@ -149,10 +181,10 @@ func (dpm *Manager) startPluginServers(pluginMap map[string]devicePlugin) {
 	wg.Wait()
 }
 
-func (dpm *Manager) stopPluginServers(pluginMap map[string]devicePlugin) {
+func (dpm *Manager) stopPluginServers() {
 	var wg sync.WaitGroup
 
-	for pluginLastName, currentPlugin := range pluginMap {
+	for pluginLastName, currentPlugin := range dpm.iterPluginMap() {
 		wg.Add(1)
 		go func(name string, plugin devicePlugin) {
 			stopPluginServer(name, plugin)
@@ -162,17 +194,14 @@ func (dpm *Manager) stopPluginServers(pluginMap map[string]devicePlugin) {
 	wg.Wait()
 }
 
-func (dpm *Manager) stopPlugins(pluginMap map[string]devicePlugin) {
+func (dpm *Manager) stopPlugins() {
 	var wg sync.WaitGroup
-	var pluginMapMutex = &sync.Mutex{}
 
-	for pluginLastName, currentPlugin := range pluginMap {
+	for pluginLastName, currentPlugin := range dpm.iterPluginMap() {
 		wg.Add(1)
 		go func(name string, plugin devicePlugin) {
 			stopPlugin(name, plugin)
-			pluginMapMutex.Lock()
-			delete(pluginMap, name)
-			pluginMapMutex.Unlock()
+			dpm.delDevicePlugin(name)
 			wg.Done()
 		}(pluginLastName, currentPlugin)
 	}
