@@ -1,4 +1,4 @@
-module github.com/kubevirt/device-plugin-manager
+module github.com/hujun-open/device-plugin-manager
 
 go 1.25
 
